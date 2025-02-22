@@ -1,0 +1,359 @@
+#!/bin/bash
+
+CLOUDFLARED_DIR="$HOME/.cloudflared"
+
+# Ensure cloudflared directory exists
+if [ ! -d "$CLOUDFLARED_DIR" ]; then
+    mkdir -p "$CLOUDFLARED_DIR"
+fi
+
+# Function to validate tunnel name
+validate_tunnel_name() {
+    if [[ ! $1 =~ ^[a-zA-Z0-9-]+$ ]]; then
+        echo "Error: Tunnel name must contain only letters, numbers, and hyphens"
+        exit 1
+    fi
+}
+
+# Function to validate port number
+validate_port() {
+    if ! [[ $1 =~ ^[0-9]+$ ]] || [ "$1" -lt 1 ] || [ "$1" -gt 65535 ]; then
+        echo "Error: Port must be a number between 1 and 65535"
+        exit 1
+    fi
+}
+
+# Function to validate subdomain
+validate_subdomain() {
+    if [[ ! $1 =~ ^[a-zA-Z0-9-]+$ ]]; then
+        echo "Error: Subdomain must contain only letters, numbers, and hyphens"
+        exit 1
+    fi
+}
+
+# Function to create tunnel
+create_tunnel() {
+    local tunnel_name=$1
+    local port=$2
+    local subdomain=$3
+    local make_service=$4
+
+    # Validate inputs
+    validate_tunnel_name "$tunnel_name"
+    validate_port "$port"
+    validate_subdomain "$subdomain"
+
+    # Create tunnel and get UUID
+    echo "Creating tunnel: $tunnel_name"
+    tunnel_output=$(cloudflared tunnel create "$tunnel_name" 2>&1)
+
+    if [ $? -ne 0 ]; then
+        echo "Error creating tunnel: $tunnel_output"
+        exit 1
+    fi
+
+    tunnel_id=$(echo "$tunnel_output" | grep -o '[a-f0-9]\{8\}-[a-f0-9]\{4\}-[a-f0-9]\{4\}-[a-f0-9]\{4\}-[a-f0-9]\{12\}' | head -n1)
+
+    if [ -z "$tunnel_id" ]; then
+        echo "Failed to create tunnel or get tunnel ID"
+        exit 1
+    fi
+
+    # Create config file with correct YAML format
+    config_file="$CLOUDFLARED_DIR/${tunnel_name}-config.yml"
+    cat > "$config_file" << EOL
+tunnel: ${tunnel_id}
+credentials-file: ${CLOUDFLARED_DIR}/${tunnel_id}.json
+ingress:
+  - hostname: ${subdomain}.$CLOUDFLARE_DOMAIN
+    service: http://localhost:${port}
+  - service: http_status:404
+EOL
+
+    # Verify config file was created
+    if [ ! -f "$config_file" ]; then
+        echo "Error: Failed to create config file"
+        exit 1
+    fi
+
+    # Create DNS record
+    dns_output=$(cloudflared tunnel route dns "$tunnel_name" "${subdomain}.$CLOUDFLARE_DOMAIN" 2>&1)
+
+    if [ $? -ne 0 ]; then
+        echo "Error creating DNS record: $dns_output"
+        exit 1
+    fi
+
+    echo
+    echo "Tunnel created successfully!"
+    echo "Name: $tunnel_name"
+    echo "ID: $tunnel_id"
+    echo "Config: $config_file"
+    echo "Hostname: ${subdomain}.$CLOUDFLARE_DOMAIN"
+    echo
+    if [ "$make_service" = "--service" ]; then
+        create_systemd_service "$tunnel_name" "$config_file"
+        echo "Systemd service created and started: ${tunnel_name}-tunnel.service"
+        echo "To check status: systemctl status ${tunnel_name}-tunnel"
+    else
+        echo "To start the tunnel, run:"
+        echo "$0 start $tunnel_name"
+    fi
+}
+
+create_systemd_service() {
+    local tunnel_name=$1
+    local config_file=$2
+    local service_file="/etc/systemd/system/${tunnel_name}-tunnel.service"
+
+    # Create systemd service file
+    sudo tee "$service_file" > /dev/null << EOL
+[Unit]
+Description=Cloudflare Tunnel for ${tunnel_name}
+After=network.target
+
+[Service]
+Type=simple
+User=$USER
+ExecStart=$(which cloudflared) tunnel --config ${config_file} run ${tunnel_name}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOL
+
+    # Reload systemd, enable and start the service
+    sudo systemctl daemon-reload
+    sudo systemctl enable "${tunnel_name}-tunnel.service"
+    sudo systemctl start "${tunnel_name}-tunnel.service"
+}
+
+# Function to start tunnel
+start_tunnel() {
+    local tunnel_name=$1
+    local config_file="$CLOUDFLARED_DIR/${tunnel_name}-config.yml"
+
+    # Validate tunnel name
+    validate_tunnel_name "$tunnel_name"
+
+    if [ ! -f "$config_file" ]; then
+        echo "Error: Config file not found for tunnel: $tunnel_name"
+        echo "Config file expected at: $config_file"
+        exit 1
+    fi
+
+    echo "Starting tunnel: $tunnel_name"
+    echo "Using config file: $config_file"
+    cloudflared tunnel --config "$config_file" run "$tunnel_name"
+}
+
+info_tunnel() {
+    local tunnel_name=$1
+    validate_tunnel_name "$tunnel_name"
+    echo "Showing tunnel info for: $tunnel_name"
+    cloudflared tunnel info "$tunnel_name"
+}
+
+tail_tunnel() {
+    local tunnel_name=$1
+    validate_tunnel_name "$tunnel_name"
+    echo "Streaming logs for tunnel: $tunnel_name"
+    cloudflared tunnel tail "$tunnel_name"
+}
+
+update_cloudflared() {
+    echo "Checking for cloudflared updates..."
+    cloudflared update
+}
+
+# Function to list tunnels
+list_tunnels() {
+    echo "Listing all tunnels:"
+    cloudflared tunnel list
+}
+
+get_dns_record_id() {
+  local subdomain=$1
+  local full_domain="${subdomain}.$CLOUDFLARE_DOMAIN"
+
+  # Make the GET request and parse the JSON response using environment variables
+  local response=$(curl --silent --request GET \
+      --url "https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/dns_records" \
+      --header "Content-Type: application/json" \
+      --header "X-Auth-Email: ${CLOUDFLARE_EMAIL}" \
+      --header "X-Auth-Key: ${CLOUDFLARE_API_KEY}")
+
+  # Use jq to find the record ID where name matches our domain
+  local record_id=$(echo "$response" | jq -r ".result[] | select(.name == \"$full_domain\") | .id")
+
+  echo "$record_id"
+}
+
+# Function to delete DNS record
+delete_dns_record() {
+  local record_id=$1
+
+  # Make the DELETE request using environment variables
+  local response=$(curl --silent --request DELETE \
+      --url "https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/dns_records/$record_id" \
+      --header "Content-Type: application/json" \
+      --header "X-Auth-Email: ${CLOUDFLARE_EMAIL}" \
+      --header "X-Auth-Key: ${CLOUDFLARE_API_KEY}")
+
+  # Check if deletion was successful
+  if echo "$response" | jq -e '.success' > /dev/null; then
+      return 0
+  else
+      return 1
+  fi
+}
+
+# Function to delete tunnel
+delete_tunnel() {
+    local tunnel_name=$1
+
+    # Validate tunnel name
+    validate_tunnel_name "$tunnel_name"
+
+    # Handle systemd service if it exists
+    local service_file="/etc/systemd/system/${tunnel_name}-tunnel.service"
+    if [ -f "$service_file" ]; then
+        echo "Stopping and removing systemd service..."
+        sudo systemctl stop "${tunnel_name}-tunnel.service"
+        sudo systemctl disable "${tunnel_name}-tunnel.service"
+        sudo rm "$service_file"
+        sudo systemctl daemon-reload
+        echo "Systemd service removed"
+        sleep 2
+    fi
+
+    echo "Cleaning up any stale connections..."
+    cloudflared tunnel cleanup "$tunnel_name" 2>/dev/null
+
+    # Get the config file path
+    local config_file="$CLOUDFLARED_DIR/${tunnel_name}-config.yml"
+
+    # Extract subdomain from config file if it exists
+    local subdomain=""
+    if [ -f "$config_file" ]; then
+        # Extract subdomain from the hostname in config
+        subdomain=$(grep "hostname:" "$config_file" | head -n1 | sed -E 's/.*hostname: ([^.]+)\.mohil\.dev.*/\1/')
+    fi
+
+    echo "Deleting tunnel: $tunnel_name"
+    delete_output=$(cloudflared tunnel delete "$tunnel_name" 2>&1)
+
+    if [ $? -ne 0 ]; then
+        echo "Error deleting tunnel: $delete_output"
+        exit 1
+    fi
+
+    # If we found a subdomain, delete the DNS record
+    if [ -n "$subdomain" ]; then
+        echo "Finding DNS record for subdomain: $subdomain"
+        local record_id=$(get_dns_record_id "$subdomain")
+
+        if [ -n "$record_id" ]; then
+            echo "Deleting DNS record with ID: $record_id"
+            if delete_dns_record "$record_id"; then
+                echo "DNS record deleted successfully"
+            else
+                echo "Warning: Failed to delete DNS record"
+            fi
+        else
+            echo "Warning: No DNS record found for $subdomain.$CLOUDFLARE_DOMAIN"
+        fi
+    fi
+
+    # Remove config file if exists
+    if [ -f "$config_file" ]; then
+        rm "$config_file"
+        echo "Deleted config file: $config_file"
+    fi
+
+    echo "Tunnel deleted successfully!"
+  }
+
+# Show usage if no arguments
+usage() {
+    echo "Usage:"
+    echo "  $0 create <tunnel-name> <port> <subdomain> [--service]   - Create a new tunnel (optionally as service)"
+    echo "  $0 start <tunnel-name>                                   - Start a tunnel"
+    echo "  $0 list                                                  - List all tunnels"
+    echo "  $0 delete <tunnel-name>                                  - Delete a tunnel"
+    echo "  $0 info <tunnel-name>                                    - Show tunnel details"
+    echo "  $0 tail <tunnel-name>                                    - Stream tunnel logs"
+    echo "  $0 update                                                - Update cloudflared"
+    echo
+    echo "Examples:"
+    echo "  $0 create flask-app 5000 app         - Creates tunnel for port 5000 at app.$CLOUDFLARE_DOMAIN"
+    echo "  $0 create flask-app 5000 app --service - Creates and starts tunnel as systemd service"
+    echo "  $0 start flask-app                   - Starts the flask-app tunnel"
+    echo "  $0 list                             - Lists all existing tunnels"
+    echo "  $0 delete flask-app                 - Deletes the flask-app tunnel"
+    exit 1
+}
+
+# Check if cloudflared is installed
+if ! command -v cloudflared &> /dev/null; then
+    echo "Error: cloudflared is not installed"
+    echo "Please install cloudflared first: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation"
+    exit 1
+fi
+
+# Main script
+case "$1" in
+    create)
+        if [ "$#" -lt 4 ] || [ "$#" -gt 5 ]; then
+            echo "Error: create command requires 3-4 arguments"
+            echo "Usage: $0 create <tunnel-name> <port> <subdomain> [--service]"
+            exit 1
+        fi
+        create_tunnel "$2" "$3" "$4" "$5"
+        ;;
+    list)
+        list_tunnels
+        ;;
+    delete)
+        if [ "$#" -ne 2 ]; then
+            echo "Error: delete command requires 1 argument"
+            echo "Usage: $0 delete <tunnel-name>"
+            exit 1
+        fi
+        delete_tunnel "$2"
+        ;;
+    info)
+        if [ "$#" -ne 2 ]; then
+            echo "Error: info command requires 1 argument"
+            echo "Usage: $0 info <tunnel-name>"
+            exit 1
+        fi
+        info_tunnel "$2"
+        ;;
+    tail)
+        if [ "$#" -ne 2 ]; then
+            echo "Error: tail command requires 1 argument"
+            echo "Usage: $0 tail <tunnel-name>"
+            exit 1
+        fi
+        tail_tunnel "$2"
+        ;;
+    update)
+        update_cloudflared
+        ;;
+    *)
+        usage
+        ;;
+    start)
+        if [ "$#" -ne 2 ]; then
+            echo "Error: start command requires 1 argument"
+            echo "Usage: $0 start <tunnel-name>"
+            exit 1
+        fi
+        start_tunnel "$2"
+        ;;
+    *)
+        usage
+        ;;
+esac
