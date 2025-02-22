@@ -24,7 +24,7 @@ export CLOUDFLARE_DOMAIN="yourdomain.com"
 mkdir -p ~/scripts
 
 # Download script
-curl https://raw.githubusercontent.com/yourusername/repo/main/tunnel.sh -o ~/scripts/tunnel
+curl https://raw.githubusercontent.com/mohilcode/scripts/refs/heads/main/tunnel -o ~/scripts/tunnel
 
 # Make executable
 chmod +x ~/scripts/tunnel
